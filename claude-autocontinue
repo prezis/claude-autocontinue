@@ -243,8 +243,13 @@ done
 
 # Library mode: when sourced (e.g. from tests) with CAC_LIB_ONLY=1, expose
 # the pure functions without starting the daemon or running preflight.
+# `return` only works when sourced; if someone happened to execute the script
+# with this variable set, fall back to `exit 0`. shellcheck SC2317 sees the
+# `exit` as unreachable because it only analyses one entry mode.
 if [ "${CAC_LIB_ONLY:-0}" = 1 ]; then
-    return 0 2>/dev/null || exit 0
+    return 0 2>/dev/null
+    # shellcheck disable=SC2317
+    exit 0
 fi
 
 # Preflight: confirm tmux is available and a server is running.
