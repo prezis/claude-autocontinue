@@ -1,0 +1,8 @@
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt
+● Bash(grep -iE "hit your limit|limit reached|rate limited")
+  contains phrases like "hit the same 2am reset" and "staggered resets"
+  my own prose talking about the limit banner text:
+  "you hit your limit" without the apostrophe — shouldn't match
+● Some output about rate-limited tasks that isn't actually a banner
+
+> waiting for input

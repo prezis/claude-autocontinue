@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+#
+# claude-autocontinue — zero-dependency tmux monitor that types `continue`
+# into Claude Code sessions when their rate-limit resets.
+#
+# Philosophy: one bash file, no daemons, no config files. Runs in any tmux
+# pane, polls all panes across all sessions, acts only on panes showing the
+# actual Claude Code rate-limit banner.
+#
+# Project:  https://github.com/prezis/claude-autocontinue
+# License:  MIT
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ── Defaults (override with CLI flags) ────────────────────────────────────────
+POLL_INTERVAL=300        # Seconds between full sweeps. Rate limits last 10-60m.
+SEND_COOLDOWN=60         # Min seconds between 'continue' sends to the same pane.
+SCROLLBACK_DEPTH=200     # Lines of tmux capture-pane scrollback to scan.
+TAIL_LINES=30            # Only inspect the last N lines for the live banner.
+MAX_WAIT_SECONDS=7200    # Cap the "sleep until reset" branch at 2h.
+LOG_FILE=""              # Empty = stdout only; otherwise tee to this path.
+DRY_RUN=0                # 1 = detect + log, never send keys.
+VERBOSE=0                # 1 = log every pane decision, not just actions.
+
+# Per-pane cooldown tracking: LAST_SEND["%4"]=<epoch-of-last-send>
+declare -gA LAST_SEND
+
+# ── Portability shims: BSD `date` on macOS lacks `-d`, GNU has it ──────────────
+DATE_BIN="date"
+if ! date -d "2pm" +%s >/dev/null 2>&1; then
+    if command -v gdate >/dev/null 2>&1; then
+        DATE_BIN="gdate"
+    else
+        echo "error: need GNU date with -d support (install coreutils: 'brew install coreutils' on macOS)" >&2
+        exit 1
+    fi
+fi
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log() {
+    local ts msg
+    ts="$($DATE_BIN +%H:%M:%S)"
+    msg="[$ts] $*"
+    if [ -n "$LOG_FILE" ]; then
+        printf '%s\n' "$msg" | tee -a "$LOG_FILE"
+    else
+        printf '%s\n' "$msg"
+    fi
+}
+
+log_verbose() { [ "$VERBOSE" = 1 ] && log "$@" || true; }
+
+# ── Pure functions (testable) ─────────────────────────────────────────────────
+
+# is_claude_code <content>
+# Returns 0 if the content looks like a live Claude Code TUI pane.
+# Detects by persistent UI markers rather than window name (which users rename).
+is_claude_code() {
+    local content="$1"
+    printf '%s' "$content" | grep -qE '⏵⏵|esc to interrupt|shift\+tab to cycle'
+}
+
+# has_rate_limit_banner <tail_content>
+# Tight regex: requires the possessive "You've" contraction (rare in prose)
+# OR the "Limit reached" phrase followed by whitespace + a banner glyph
+# (· middle-dot, ∙ bullet, or open paren for the minutes-remaining format).
+# Scope to the TAIL of the capture since Claude Code always redraws its status
+# at the bottom of the TUI — full scrollback may contain prose/logs that
+# mention the banner text without being the live banner.
+has_rate_limit_banner() {
+    local tail_content="$1"
+    printf '%s' "$tail_content" \
+        | grep -qE "[Yy]ou[']ve hit your limit|[Ll]imit reached[[:space:]]+[·∙(]"
+}
+
+# parse_reset_time <tail_content>
+# Extract the last reset time string like "2am", "10:30pm", "8m". Returns
+# empty string if none found. Uses grep -oE (portable) + sed to drop the
+# `resets ` prefix; avoids `grep -P \K` which isn't on BSD grep.
+parse_reset_time() {
+    local tail_content="$1"
+    printf '%s' "$tail_content" \
+        | grep -oiE 'resets?[[:space:]]+[0-9]{1,2}(:[0-9]{2})?[[:space:]]*[ap]m' \
+        | tail -1 \
+        | sed -E 's/^[Rr]esets?[[:space:]]+//'
+}
+
+# epoch_of_reset <reset_time_string>
+# Parse "2am" / "10:30pm" into a unix epoch for today's date. Echoes 0 on
+# failure. Uses $DATE_BIN so macOS (gdate) works.
+epoch_of_reset() {
+    local reset="$1"
+    [ -z "$reset" ] && { echo 0; return; }
+    $DATE_BIN -d "$reset" +%s 2>/dev/null || echo 0
+}
+
+# ── Tmux wrappers ─────────────────────────────────────────────────────────────
+
+pane_exists() {
+    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$1"
+}
+
+capture_pane() {
+    tmux capture-pane -t "$1" -p -S "-${SCROLLBACK_DEPTH}" 2>/dev/null || true
+}
+
+send_continue() {
+    local pane_id="$1" window_name="$2"
+    if [ "$DRY_RUN" = 1 ]; then
+        log "DRY-RUN $window_name ($pane_id): would send 'continue'"
+        return
+    fi
+    if ! pane_exists "$pane_id"; then
+        log "$window_name ($pane_id): pane gone, skipping"
+        return
+    fi
+    log "$window_name ($pane_id): sending continue"
+    tmux send-keys -t "$pane_id" "continue" Enter
+    LAST_SEND["$pane_id"]="$($DATE_BIN +%s)"
+}
+
+# ── Main polling loop ─────────────────────────────────────────────────────────
+
+poll_once() {
+    local panes pane_id window_name content tail_content reset now reset_epoch last wait remaining
+
+    # Use `|` as field separator so window names with spaces don't split.
+    panes="$(tmux list-panes -a -F '#{pane_id}|#{window_name}' 2>/dev/null || true)"
+    [ -z "$panes" ] && return
+
+    while IFS='|' read -r pane_id window_name; do
+        [ -z "$pane_id" ] && continue
+
+        content="$(capture_pane "$pane_id")"
+        is_claude_code "$content" || { log_verbose "$window_name ($pane_id): not claude code"; continue; }
+
+        tail_content="$(printf '%s\n' "$content" | tail -n "$TAIL_LINES")"
+        has_rate_limit_banner "$tail_content" || { log_verbose "$window_name ($pane_id): claude, no banner"; continue; }
+
+        # Per-pane cooldown prevents spam from surviving banners in scrollback.
+        now="$($DATE_BIN +%s)"
+        last="${LAST_SEND[$pane_id]:-0}"
+        if [ "$((now - last))" -lt "$SEND_COOLDOWN" ]; then
+            log_verbose "$window_name ($pane_id): banner seen, in cooldown ($((now - last))s < ${SEND_COOLDOWN}s)"
+            continue
+        fi
+
+        reset="$(parse_reset_time "$tail_content")"
+        if [ -z "$reset" ]; then
+            log "$window_name ($pane_id): banner detected (no reset time parsed)"
+            send_continue "$pane_id" "$window_name"
+            sleep 2
+            continue
+        fi
+
+        reset_epoch="$(epoch_of_reset "$reset")"
+        if [ "$reset_epoch" = 0 ]; then
+            log "$window_name ($pane_id): banner detected, reset '$reset' unparseable"
+            send_continue "$pane_id" "$window_name"
+            sleep 2
+            continue
+        fi
+
+        if [ "$now" -ge "$reset_epoch" ]; then
+            log "$window_name ($pane_id): reset time ($reset) passed — sending continue"
+            send_continue "$pane_id" "$window_name"
+            sleep 2
+            continue
+        fi
+
+        remaining=$(( (reset_epoch - now) / 60 ))
+        wait=$(( reset_epoch - now + 30 ))
+        log "$window_name ($pane_id): rate-limited, resets in ${remaining}m ($reset)"
+        if [ "$wait" -gt 0 ] && [ "$wait" -lt "$MAX_WAIT_SECONDS" ]; then
+            log "  sleeping ${wait}s until reset"
+            sleep "$wait"
+            return  # break out of this poll pass so the next one re-scans everything fresh
+        fi
+    done <<< "$panes"
+}
+
+# ── Signal handling ───────────────────────────────────────────────────────────
+
+on_exit() {
+    log "claude-autocontinue stopping"
+    exit 0
+}
+trap on_exit INT TERM
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+claude-autocontinue — auto-resume Claude Code tmux panes after rate limits
+
+Usage:
+  claude-autocontinue [OPTIONS]
+
+Options:
+  --interval N         Seconds between poll sweeps      (default: 300)
+  --cooldown N         Min seconds between 'continue' sends per pane (default: 60)
+  --scrollback N       Tmux capture scrollback depth     (default: 200)
+  --tail N             Lines at end of capture to scan   (default: 30)
+  --max-wait N         Cap for "sleep until reset" (sec) (default: 7200)
+  --log-file PATH      Tee log output to this file
+  --dry-run            Detect and log only — never send keys
+  --verbose            Log per-pane decisions, not just actions
+  -h, --help           Show this help
+  -V, --version        Print version and exit
+
+Run it in any tmux pane:
+  claude-autocontinue &
+
+It discovers Claude Code sessions automatically across all tmux sessions by
+content signature (not window name), so `/rename` inside Claude Code does not
+break detection.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --interval)     POLL_INTERVAL="$2"; shift 2 ;;
+        --cooldown)     SEND_COOLDOWN="$2"; shift 2 ;;
+        --scrollback)   SCROLLBACK_DEPTH="$2"; shift 2 ;;
+        --tail)         TAIL_LINES="$2"; shift 2 ;;
+        --max-wait)     MAX_WAIT_SECONDS="$2"; shift 2 ;;
+        --log-file)     LOG_FILE="$2"; shift 2 ;;
+        --dry-run)      DRY_RUN=1; shift ;;
+        --verbose|-v)   VERBOSE=1; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        -V|--version)   echo "claude-autocontinue $VERSION"; exit 0 ;;
+        *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+# Library mode: when sourced (e.g. from tests), expose the pure functions
+# without starting the daemon or running preflight.
+[ "${CAC_LIB_ONLY:-0}" = 1 ] && return 0 2>/dev/null || true
+
+# Preflight: confirm tmux is available and a server is running.
+command -v tmux >/dev/null 2>&1 || { echo "error: tmux not found in PATH" >&2; exit 1; }
+tmux list-sessions >/dev/null 2>&1 || { echo "error: no running tmux server" >&2; exit 1; }
+
+log "claude-autocontinue $VERSION starting"
+log "poll=${POLL_INTERVAL}s cooldown=${SEND_COOLDOWN}s scrollback=${SCROLLBACK_DEPTH} tail=${TAIL_LINES}${DRY_RUN:+ DRY-RUN}"
+
+while true; do
+    poll_once
+    sleep "$POLL_INTERVAL"
+done

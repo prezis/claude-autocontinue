@@ -1,0 +1,6 @@
+$ ps aux | grep nginx
+root     1234  0.0  0.1  12345 678 pts/0 S+  12:34 0:00 nginx
+$ tail -f /var/log/syslog
+Apr 17 07:00:01 host CRON[1234]: some cron job ran
+Apr 17 07:05:00 host systemd[1]: some limit reached for a service
+$

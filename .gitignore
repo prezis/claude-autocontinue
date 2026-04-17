@@ -1,0 +1,4 @@
+*.log
+.claude-autocontinue.log
+tests/tmp/
+.DS_Store

@@ -1,0 +1,4 @@
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt
+some earlier context
+Limit reached (resets 8m)
+>
