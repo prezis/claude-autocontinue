@@ -1,5 +1,8 @@
 # claude-autocontinue
 
+[![CI](https://github.com/prezis/claude-autocontinue/actions/workflows/ci.yml/badge.svg)](https://github.com/prezis/claude-autocontinue/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A zero-dependency bash script that watches your tmux panes and automatically
 types `continue` into Claude Code sessions when their rate limit resets.
 
