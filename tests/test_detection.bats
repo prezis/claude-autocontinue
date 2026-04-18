@@ -86,6 +86,16 @@ setup() {
     [ "$status" -eq 0 ]
 }
 
+@test "has_server_rate_limit_error: detects with HTTP status code (429)" {
+    run has_server_rate_limit_error "API Error: 429 Server is temporarily limiting requests"
+    [ "$status" -eq 0 ]
+}
+
+@test "has_server_rate_limit_error: detects with HTTP status code (529)" {
+    run has_server_rate_limit_error "API Error: 529 Server is temporarily limiting requests · Rate limited"
+    [ "$status" -eq 0 ]
+}
+
 @test "has_server_rate_limit_error: ignores prose about rate limits" {
     run has_server_rate_limit_error "$(cat "$FIXTURES/prose_server_rate_limit_false_positive.txt")"
     [ "$status" -ne 0 ]

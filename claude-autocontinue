@@ -90,10 +90,12 @@ has_rate_limit_banner() {
 # to minutes. Strategy: send `continue` to retry, then enforce a longer cooldown
 # (SERVER_LIMIT_COOLDOWN) so we don't hammer an already-overloaded backend.
 # Same tail-only scoping rationale as has_rate_limit_banner.
+# Regex allows an optional HTTP status code between "API Error:" and the phrase
+# (Claude Code may render either "API Error: Server..." or "API Error: 429 Server...").
 has_server_rate_limit_error() {
     local tail_content="$1"
     printf '%s' "$tail_content" \
-        | grep -qE "API Error:[[:space:]]+Server is temporarily limiting requests"
+        | grep -qE "API Error:[[:space:]]+([0-9]+[[:space:]]+)?Server is temporarily limiting requests"
 }
 
 # parse_reset_time <tail_content>

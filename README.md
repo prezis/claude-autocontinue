@@ -10,26 +10,38 @@ One file. No daemon. No config. Runs in any tmux pane.
 
 ```
 $ claude-autocontinue &
-[07:20:10] claude-autocontinue 1.0.0 starting
-[07:20:10] poll=300s cooldown=60s scrollback=200 tail=30
+[07:20:10] claude-autocontinue 1.1.0 starting
+[07:20:10] poll=300s cooldown=60s server-cooldown=120s scrollback=200 tail=30
 [07:20:15] sudo (%5): rate-limited, resets in 54m (2am)
 [07:20:15]   sleeping 3270s until reset
 [08:14:47] sudo (%5): reset time (2am) passed — sending continue
 [08:14:47] sudo (%5): sending continue
+[09:31:02] fibo (%7): server rate-limit (transient) — sending continue
+[09:31:02] fibo (%7): sending continue
 ```
 
 ## The problem
 
 When you run Claude Code heavily — especially across several parallel tmux
-panes — you hit the usage limit and get a banner like:
+panes — you hit one of two distinct rate-limit screens that both stall the
+session until you manually type `continue`:
+
+**1. Personal usage limit** (resets at a known time):
 
 ```
 You've hit your limit · resets 2am (Europe/London)
 /extra-usage to finish what you're working on.
 ```
 
-You then have to remember to come back later and type `continue`. If you have
-six Claude sessions in six panes, that's six manual resumes.
+**2. Transient server rate limit** (Anthropic backend overload, no reset time):
+
+```
+API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited
+```
+
+You then have to remember to come back later (or right now) and type
+`continue`. If you have six Claude sessions in six panes, that's six manual
+resumes for either failure mode.
 
 ## The approach
 
@@ -48,15 +60,21 @@ six Claude sessions in six panes, that's six manual resumes.
 - **Parses the reset time and sleeps until then.** If the banner shows
   `resets 2am`, the script sleeps until 02:00:30 rather than polling every
   5 minutes for hours.
-- **60-second per-pane cooldown.** Defense in depth against surviving banners
-  in scrollback or future regex drift — never sends `continue` to the same
-  pane twice within 60 seconds.
+- **Also handles transient server rate limits.** If the API returns
+  `Server is temporarily limiting requests (not your usage limit)`, the
+  script retries immediately (no reset time exists) but enforces a longer
+  120-second per-pane cooldown so it never hammers an overloaded backend.
+- **60-second per-pane cooldown** (usage-limit branch) and **120-second
+  per-pane cooldown** (server-limit branch). Two independent cooldown maps
+  so a server hiccup in one pane doesn't block a usage-limit retry in
+  another. Defense in depth against surviving banners in scrollback or
+  future regex drift.
 - **Stale pane guard.** If a pane is closed during the sleep-until-reset
   wait, the `send-keys` call is skipped with a "pane gone" log line.
 
 ## Install
 
-One file, 200 lines of bash. Drop it on your `PATH`:
+One file, ~300 lines of bash. Drop it on your `PATH`:
 
 ```bash
 git clone https://github.com/prezis/claude-autocontinue.git
@@ -115,21 +133,29 @@ journalctl --user -u claude-autocontinue -f
 
 ## How detection works
 
-Two independent checks, both required:
+Three independent checks. Pane signature is always required; the two banner
+detectors then route to two different actions:
 
 1. **Pane is Claude Code** — the captured content contains one of:
    `⏵⏵`, `esc to interrupt`, or `shift+tab to cycle`.
-2. **Live banner at the bottom** — the last 30 lines of capture match
+2. **Server rate-limit error (transient)** — last 30 lines match:
+   ```
+   API Error:[[:space:]]+Server is temporarily limiting requests
+   ```
+   Action: send `continue` immediately (no reset time to wait for), then
+   enforce a 120-second per-pane cooldown so we don't hammer an already-
+   overloaded backend. Tunable with `--server-cooldown N`.
+3. **Personal usage-limit banner** — last 30 lines match
    `[Yy]ou[']ve hit your limit` OR `[Ll]imit reached` followed by whitespace +
-   `·` / `∙` / `(`.
+   `·` / `∙` / `(`. Reset time is then extracted with:
+   ```
+   resets?[[:space:]]+[0-9]{1,2}(:[0-9]{2})?[[:space:]]*[ap]m
+   ```
+   …covering `resets 2am`, `resets 10:30pm`, `resets 8m`. The script then
+   sleeps until the reset and sends `continue`.
 
-Reset time is then extracted with:
-
-```
-resets?[[:space:]]+[0-9]{1,2}(:[0-9]{2})?[[:space:]]*[ap]m
-```
-
-…covering `resets 2am`, `resets 10:30pm`, `resets 8m`.
+The server rate-limit branch runs first: a server error in the tail is the
+more recent state and warrants an immediate retry rather than a long sleep.
 
 ## Known limitations
 
@@ -165,15 +191,16 @@ bats tests/
 ```
 
 The pure functions (`is_claude_code`, `has_rate_limit_banner`,
-`parse_reset_time`, `epoch_of_reset`) are isolated specifically so they can
-be sourced with `CAC_LIB_ONLY=1` and tested without running the poll loop.
+`has_server_rate_limit_error`, `parse_reset_time`, `epoch_of_reset`) are
+isolated specifically so they can be sourced with `CAC_LIB_ONLY=1` and tested
+without running the poll loop.
 
 ## Credits & related
 
 - [henryaj/autoclaude](https://github.com/henryaj/autoclaude) — a polished
   Bubble Tea TUI doing the same job in Go. Recommended if you want an
   interactive per-pane enable/disable interface. This project is the
-  minimalist bash alternative for people who want to read all 200 lines of
+  minimalist bash alternative for people who want to read all ~300 lines of
   code in one sitting and drop it on a server as a one-file service.
 
 ## License
