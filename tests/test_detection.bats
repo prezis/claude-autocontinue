@@ -27,6 +27,11 @@ setup() {
     [ "$status" -eq 0 ]
 }
 
+@test "is_claude_code: matches server-rate-limit fixture" {
+    run is_claude_code "$(cat "$FIXTURES/banner_server_rate_limit.txt")"
+    [ "$status" -eq 0 ]
+}
+
 @test "is_claude_code: rejects plain shell transcript" {
     run is_claude_code "$(cat "$FIXTURES/not_claude_code.txt")"
     [ "$status" -ne 0 ]
@@ -61,6 +66,43 @@ setup() {
 
 @test "has_rate_limit_banner: ignores 'limit reached' without banner glyph" {
     run has_rate_limit_banner "the limit reached five but then stopped"
+    [ "$status" -ne 0 ]
+}
+
+@test "has_rate_limit_banner: ignores server-rate-limit fixture (different branch)" {
+    run has_rate_limit_banner "$(cat "$FIXTURES/banner_server_rate_limit.txt")"
+    [ "$status" -ne 0 ]
+}
+
+# ── has_server_rate_limit_error ───────────────────────────────────────────────
+
+@test "has_server_rate_limit_error: detects 'API Error: Server is temporarily limiting requests'" {
+    run has_server_rate_limit_error "$(cat "$FIXTURES/banner_server_rate_limit.txt")"
+    [ "$status" -eq 0 ]
+}
+
+@test "has_server_rate_limit_error: detects on a one-line input" {
+    run has_server_rate_limit_error "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+    [ "$status" -eq 0 ]
+}
+
+@test "has_server_rate_limit_error: ignores prose about rate limits" {
+    run has_server_rate_limit_error "$(cat "$FIXTURES/prose_server_rate_limit_false_positive.txt")"
+    [ "$status" -ne 0 ]
+}
+
+@test "has_server_rate_limit_error: ignores usage-limit banner (different branch)" {
+    run has_server_rate_limit_error "$(cat "$FIXTURES/banner_new_format.txt")"
+    [ "$status" -ne 0 ]
+}
+
+@test "has_server_rate_limit_error: ignores plain 'rate limited' without API Error prefix" {
+    run has_server_rate_limit_error "the request was rate limited yesterday"
+    [ "$status" -ne 0 ]
+}
+
+@test "has_server_rate_limit_error: requires 'API Error:' prefix (no bare phrase)" {
+    run has_server_rate_limit_error "Server is temporarily limiting requests"
     [ "$status" -ne 0 ]
 }
 
