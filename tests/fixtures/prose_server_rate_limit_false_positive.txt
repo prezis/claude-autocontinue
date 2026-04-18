@@ -1,0 +1,8 @@
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt
+● Bash(grep -iE "server is temporarily limiting|rate limited")
+  contains my prose discussing the banner pattern: the daemon
+  watches for "API Error" lines, but mentions of API errors
+  in code comments, READMEs or grep output should not match
+  unless they are the actual live banner format.
+
+> waiting for input

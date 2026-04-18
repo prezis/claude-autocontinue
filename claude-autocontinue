@@ -12,20 +12,22 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ── Defaults (override with CLI flags) ────────────────────────────────────────
-POLL_INTERVAL=300        # Seconds between full sweeps. Rate limits last 10-60m.
-SEND_COOLDOWN=60         # Min seconds between 'continue' sends to the same pane.
-SCROLLBACK_DEPTH=200     # Lines of tmux capture-pane scrollback to scan.
-TAIL_LINES=30            # Only inspect the last N lines for the live banner.
-MAX_WAIT_SECONDS=7200    # Cap the "sleep until reset" branch at 2h.
-LOG_FILE=""              # Empty = stdout only; otherwise tee to this path.
-DRY_RUN=0                # 1 = detect + log, never send keys.
-VERBOSE=0                # 1 = log every pane decision, not just actions.
+POLL_INTERVAL=300         # Seconds between full sweeps. Rate limits last 10-60m.
+SEND_COOLDOWN=60          # Min seconds between 'continue' sends to the same pane (usage limit).
+SERVER_LIMIT_COOLDOWN=120 # Min seconds between retries on transient server rate-limit errors.
+SCROLLBACK_DEPTH=200      # Lines of tmux capture-pane scrollback to scan.
+TAIL_LINES=30             # Only inspect the last N lines for the live banner.
+MAX_WAIT_SECONDS=7200     # Cap the "sleep until reset" branch at 2h.
+LOG_FILE=""               # Empty = stdout only; otherwise tee to this path.
+DRY_RUN=0                 # 1 = detect + log, never send keys.
+VERBOSE=0                 # 1 = log every pane decision, not just actions.
 
 # Per-pane cooldown tracking: LAST_SEND["%4"]=<epoch-of-last-send>
 declare -gA LAST_SEND
+declare -gA LAST_SERVER_SEND
 
 # ── Portability shims: BSD `date` on macOS lacks `-d`, GNU has it ──────────────
 DATE_BIN="date"
@@ -79,6 +81,21 @@ has_rate_limit_banner() {
         | grep -qE "[Yy]ou[']ve hit your limit|[Ll]imit reached[[:space:]]+[·∙(]"
 }
 
+# has_server_rate_limit_error <tail_content>
+# Detects the *transient* server-side rate limit (HTTP 429/529 from the
+# Anthropic API), distinct from the personal usage limit. Format Claude Code
+# prints inline:
+#   API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited
+# Has NO reset time — the server is overloaded and clears on its own in seconds
+# to minutes. Strategy: send `continue` to retry, then enforce a longer cooldown
+# (SERVER_LIMIT_COOLDOWN) so we don't hammer an already-overloaded backend.
+# Same tail-only scoping rationale as has_rate_limit_banner.
+has_server_rate_limit_error() {
+    local tail_content="$1"
+    printf '%s' "$tail_content" \
+        | grep -qE "API Error:[[:space:]]+Server is temporarily limiting requests"
+}
+
 # parse_reset_time <tail_content>
 # Extract the last reset time string like "2am", "10:30pm", "8m". Returns
 # empty string if none found. Uses grep -oE (portable) + sed to drop the
@@ -130,7 +147,7 @@ send_continue() {
 # ── Main polling loop ─────────────────────────────────────────────────────────
 
 poll_once() {
-    local panes pane_id window_name content tail_content reset now reset_epoch last wait remaining
+    local panes pane_id window_name content tail_content reset now reset_epoch last wait remaining last_server
 
     # Use `|` as field separator so window names with spaces don't split.
     panes="$(tmux list-panes -a -F '#{pane_id}|#{window_name}' 2>/dev/null || true)"
@@ -143,10 +160,29 @@ poll_once() {
         is_claude_code "$content" || { log_verbose "$window_name ($pane_id): not claude code"; continue; }
 
         tail_content="$(printf '%s\n' "$content" | tail -n "$TAIL_LINES")"
+        now="$($DATE_BIN +%s)"
+
+        # ── Branch A: transient server rate-limit (no reset time, retry now) ──
+        # Checked before the usage-limit branch because both can in theory
+        # appear in the same tail; a server error in the tail is the more
+        # recent state and warrants an immediate retry rather than a long sleep.
+        if has_server_rate_limit_error "$tail_content"; then
+            last_server="${LAST_SERVER_SEND[$pane_id]:-0}"
+            if [ "$((now - last_server))" -lt "$SERVER_LIMIT_COOLDOWN" ]; then
+                log_verbose "$window_name ($pane_id): server rate-limit, in cooldown ($((now - last_server))s < ${SERVER_LIMIT_COOLDOWN}s)"
+                continue
+            fi
+            log "$window_name ($pane_id): server rate-limit (transient) — sending continue"
+            send_continue "$pane_id" "$window_name"
+            LAST_SERVER_SEND["$pane_id"]="$($DATE_BIN +%s)"
+            sleep 2
+            continue
+        fi
+
+        # ── Branch B: personal usage limit (parse reset time, sleep until) ──
         has_rate_limit_banner "$tail_content" || { log_verbose "$window_name ($pane_id): claude, no banner"; continue; }
 
         # Per-pane cooldown prevents spam from surviving banners in scrollback.
-        now="$($DATE_BIN +%s)"
         last="${LAST_SEND[$pane_id]:-0}"
         if [ "$((now - last))" -lt "$SEND_COOLDOWN" ]; then
             log_verbose "$window_name ($pane_id): banner seen, in cooldown ($((now - last))s < ${SEND_COOLDOWN}s)"
@@ -207,6 +243,7 @@ Usage:
 Options:
   --interval N         Seconds between poll sweeps      (default: 300)
   --cooldown N         Min seconds between 'continue' sends per pane (default: 60)
+  --server-cooldown N  Min seconds between retries on transient server rate limits (default: 120)
   --scrollback N       Tmux capture scrollback depth     (default: 200)
   --tail N             Lines at end of capture to scan   (default: 30)
   --max-wait N         Cap for "sleep until reset" (sec) (default: 7200)
@@ -227,16 +264,17 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --interval)     POLL_INTERVAL="$2"; shift 2 ;;
-        --cooldown)     SEND_COOLDOWN="$2"; shift 2 ;;
-        --scrollback)   SCROLLBACK_DEPTH="$2"; shift 2 ;;
-        --tail)         TAIL_LINES="$2"; shift 2 ;;
-        --max-wait)     MAX_WAIT_SECONDS="$2"; shift 2 ;;
-        --log-file)     LOG_FILE="$2"; shift 2 ;;
-        --dry-run)      DRY_RUN=1; shift ;;
-        --verbose|-v)   VERBOSE=1; shift ;;
-        -h|--help)      usage; exit 0 ;;
-        -V|--version)   echo "claude-autocontinue $VERSION"; exit 0 ;;
+        --interval)         POLL_INTERVAL="$2"; shift 2 ;;
+        --cooldown)         SEND_COOLDOWN="$2"; shift 2 ;;
+        --server-cooldown)  SERVER_LIMIT_COOLDOWN="$2"; shift 2 ;;
+        --scrollback)       SCROLLBACK_DEPTH="$2"; shift 2 ;;
+        --tail)             TAIL_LINES="$2"; shift 2 ;;
+        --max-wait)         MAX_WAIT_SECONDS="$2"; shift 2 ;;
+        --log-file)         LOG_FILE="$2"; shift 2 ;;
+        --dry-run)          DRY_RUN=1; shift ;;
+        --verbose|-v)       VERBOSE=1; shift ;;
+        -h|--help)          usage; exit 0 ;;
+        -V|--version)       echo "claude-autocontinue $VERSION"; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
@@ -257,7 +295,7 @@ command -v tmux >/dev/null 2>&1 || { echo "error: tmux not found in PATH" >&2; e
 tmux list-sessions >/dev/null 2>&1 || { echo "error: no running tmux server" >&2; exit 1; }
 
 log "claude-autocontinue $VERSION starting"
-log "poll=${POLL_INTERVAL}s cooldown=${SEND_COOLDOWN}s scrollback=${SCROLLBACK_DEPTH} tail=${TAIL_LINES}${DRY_RUN:+ DRY-RUN}"
+log "poll=${POLL_INTERVAL}s cooldown=${SEND_COOLDOWN}s server-cooldown=${SERVER_LIMIT_COOLDOWN}s scrollback=${SCROLLBACK_DEPTH} tail=${TAIL_LINES}${DRY_RUN:+ DRY-RUN}"
 
 while true; do
     poll_once

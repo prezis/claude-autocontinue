@@ -1,0 +1,7 @@
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt
+  ⎿  Bash(some earlier tool call result)
+
+● Listed 1 directory (ctrl+o to expand)
+  ⎿  API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited
+
+>
