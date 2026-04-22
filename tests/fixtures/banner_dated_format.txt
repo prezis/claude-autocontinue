@@ -1,0 +1,11 @@
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt
+  ⎿  Bash(earlier tool call result)
+
+● older output line
+
+╭──────────────────────────────────────────────────────────────────────╮
+│   You've hit your limit · resets Apr 23, 9pm (Europe/London)         │
+│   /extra-usage to finish what you're working on.                     │
+╰──────────────────────────────────────────────────────────────────────╯
+
+>

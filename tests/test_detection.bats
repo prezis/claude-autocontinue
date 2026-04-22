@@ -144,6 +144,28 @@ setup() {
     [ "$result" = "2pm" ]
 }
 
+# v1.2.0 — dated banner form: "resets Apr 23, 9pm (Europe/London)"
+@test "parse_reset_time: extracts dated form 'Apr 23, 9pm'" {
+    result="$(parse_reset_time "$(cat "$FIXTURES/banner_dated_format.txt")")"
+    [ "$result" = "Apr 23, 9pm" ]
+}
+
+@test "parse_reset_time: extracts dated form without comma" {
+    result="$(parse_reset_time "You've hit your limit · resets Apr 23 9pm (UTC)")"
+    [ "$result" = "Apr 23 9pm" ]
+}
+
+@test "parse_reset_time: extracts dated form with minutes" {
+    result="$(parse_reset_time "resets Dec 5, 10:30pm (Europe/London)")"
+    [ "$result" = "Dec 5, 10:30pm" ]
+}
+
+@test "parse_reset_time: dated form takes priority over legacy in same buffer" {
+    input=$'noise resets 2am\nactual banner resets May 1, 7am'
+    result="$(parse_reset_time "$input")"
+    [ "$result" = "May 1, 7am" ]
+}
+
 # ── epoch_of_reset ────────────────────────────────────────────────────────────
 
 @test "epoch_of_reset: '2am' parses to a non-zero epoch" {
@@ -159,4 +181,58 @@ setup() {
 @test "epoch_of_reset: garbage returns 0" {
     result="$(epoch_of_reset "not-a-time-xyz")"
     [ "$result" = "0" ]
+}
+
+# v1.2.0 — dated form must survive the comma that GNU date rejects raw.
+@test "epoch_of_reset: dated form 'Apr 23, 9pm' parses to a non-zero epoch" {
+    result="$(epoch_of_reset "Apr 23, 9pm")"
+    [ "$result" -gt 0 ]
+}
+
+@test "epoch_of_reset: dated form with minutes parses to a non-zero epoch" {
+    result="$(epoch_of_reset "Dec 5, 10:30pm")"
+    [ "$result" -gt 0 ]
+}
+
+# v1.2.0 — TZ-aware computation (Europe/London vs UTC at Apr 23 21:00).
+@test "epoch_of_reset: explicit TZ shifts the epoch" {
+    # Apr 23 21:00 in Europe/London (BST = UTC+1) → 20:00 UTC = epoch E
+    # Apr 23 21:00 in UTC           → 21:00 UTC = epoch E + 3600
+    london="$(epoch_of_reset "Apr 23 9pm" "Europe/London")"
+    utc="$(epoch_of_reset "Apr 23 9pm" "UTC")"
+    [ "$london" -gt 0 ]
+    [ "$utc" -gt 0 ]
+    # UTC interpretation should be 1h later than London during BST.
+    [ "$((utc - london))" -eq 3600 ]
+}
+
+# ── parse_reset_timezone ──────────────────────────────────────────────────────
+
+@test "parse_reset_timezone: extracts 'Europe/London' from dated banner" {
+    result="$(parse_reset_timezone "$(cat "$FIXTURES/banner_dated_format.txt")")"
+    [ "$result" = "Europe/London" ]
+}
+
+@test "parse_reset_timezone: extracts 'America/New_York'" {
+    result="$(parse_reset_timezone "You've hit your limit · resets May 1, 7am (America/New_York)")"
+    [ "$result" = "America/New_York" ]
+}
+
+@test "parse_reset_timezone: returns empty when no TZ present" {
+    result="$(parse_reset_timezone "limit reached · resets 2am")"
+    [ -z "$result" ]
+}
+
+# ── regression: fixture → full pipeline ───────────────────────────────────────
+
+@test "fixture banner_dated_format: is_claude_code + has_rate_limit_banner + parseable" {
+    content="$(cat "$FIXTURES/banner_dated_format.txt")"
+    run is_claude_code "$content"
+    [ "$status" -eq 0 ]
+    run has_rate_limit_banner "$content"
+    [ "$status" -eq 0 ]
+    reset="$(parse_reset_time "$content")"
+    [ -n "$reset" ]
+    epoch="$(epoch_of_reset "$reset")"
+    [ "$epoch" -gt 0 ]
 }

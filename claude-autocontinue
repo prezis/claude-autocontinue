@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ── Defaults (override with CLI flags) ────────────────────────────────────────
 POLL_INTERVAL=300         # Seconds between full sweeps. Rate limits last 10-60m.
@@ -20,7 +20,7 @@ SEND_COOLDOWN=60          # Min seconds between 'continue' sends to the same pan
 SERVER_LIMIT_COOLDOWN=120 # Min seconds between retries on transient server rate-limit errors.
 SCROLLBACK_DEPTH=200      # Lines of tmux capture-pane scrollback to scan.
 TAIL_LINES=30             # Only inspect the last N lines for the live banner.
-MAX_WAIT_SECONDS=7200     # Cap the "sleep until reset" branch at 2h.
+MAX_WAIT_SECONDS=172800   # Cap "sleep until reset" at 48h (dated banners can be 24h+ away).
 LOG_FILE=""               # Empty = stdout only; otherwise tee to this path.
 DRY_RUN=0                 # 1 = detect + log, never send keys.
 VERBOSE=0                 # 1 = log every pane decision, not just actions.
@@ -99,26 +99,73 @@ has_server_rate_limit_error() {
 }
 
 # parse_reset_time <tail_content>
-# Extract the last reset time string like "2am", "10:30pm", "8m". Returns
-# empty string if none found. Uses grep -oE (portable) + sed to drop the
-# `resets ` prefix; avoids `grep -P \K` which isn't on BSD grep.
+# Extract the last reset time string like "Apr 23, 9pm", "2am", "10:30pm".
+# Returns empty string if none found. Uses grep -oE (portable) + sed to drop
+# the `resets ` prefix; avoids `grep -P \K` which isn't on BSD grep.
+#
+# v1.2.0: Claude Code changed the banner from `resets 2am (Europe/London)` to
+# `resets Apr 23, 9pm (Europe/London)` — the date prefix broke the old regex
+# and `parse_reset_time` returned empty, which in v1.1.0 silently triggered
+# the "unparseable → send continue immediately" fallback branch, producing a
+# 60s spam loop for the entire limit window. Fix: match the dated form first,
+# keep the legacy form as fallback. Tail is trimmed so the TZ suffix is
+# handled separately by epoch_of_reset.
 parse_reset_time() {
-    local tail_content="$1"
-    # grep returns exit 1 when there's no match; swallow that so `set -e`
-    # (and `set -o pipefail` when sourced with it) don't kill the caller.
+    local tail_content="$1" dated legacy
+    # New format: "resets Apr 23, 9pm" (optionally followed by " (Area/City)")
+    # Capture up to the am/pm marker — TZ suffix is parsed out of the extracted
+    # token inside epoch_of_reset, not here (keeps the regex readable).
+    dated="$(printf '%s' "$tail_content" \
+        | { grep -oiE 'resets?[[:space:]]+[A-Z][a-z]+[[:space:]]+[0-9]{1,2},?[[:space:]]*[0-9]{1,2}(:[0-9]{2})?[[:space:]]*[ap]m' || true; } \
+        | tail -1 \
+        | sed -E 's/^[Rr]esets?[[:space:]]+//')"
+    if [ -n "$dated" ]; then
+        printf '%s' "$dated"
+        return
+    fi
+    # Legacy format: "resets 2am" / "resets 10:30pm"
     printf '%s' "$tail_content" \
         | { grep -oiE 'resets?[[:space:]]+[0-9]{1,2}(:[0-9]{2})?[[:space:]]*[ap]m' || true; } \
         | tail -1 \
         | sed -E 's/^[Rr]esets?[[:space:]]+//'
 }
 
-# epoch_of_reset <reset_time_string>
-# Parse "2am" / "10:30pm" into a unix epoch for today's date. Echoes 0 on
-# failure. Uses $DATE_BIN so macOS (gdate) works.
+# parse_reset_timezone <tail_content>
+# Extract the last "(Area/City)" timezone marker that follows a reset banner.
+# Returns empty string if none. We deliberately only match within a short
+# window after `resets …[ap]m` so that an unrelated "(Europe/London)" earlier
+# in scrollback (e.g. a pasted log line) doesn't win — the banner is always
+# the LAST match so we grep the whole tail for "resets … am/pm (TZ)" and
+# strip everything except the TZ.
+parse_reset_timezone() {
+    local tail_content="$1" matched
+    matched="$(printf '%s' "$tail_content" \
+        | { grep -oiE 'resets?[[:space:]]+[^)]*[ap]m[[:space:]]*\([A-Za-z_]+/[A-Za-z_]+\)' || true; } \
+        | tail -1)"
+    [ -z "$matched" ] && return 0
+    printf '%s' "$matched" \
+        | grep -oE '\([A-Za-z_]+/[A-Za-z_]+\)' \
+        | tr -d '()'
+}
+
+# epoch_of_reset <reset_time_string> [timezone]
+# Parse "Apr 23, 9pm" / "2am" / "10:30pm" into a unix epoch. Echoes 0 on
+# failure. Uses $DATE_BIN so macOS (gdate) works. Strips the comma in the
+# dated form since GNU date -d accepts "Apr 23 9pm" but rejects "Apr 23, 9pm".
+# If an IANA timezone is provided, interprets the reset string in that zone —
+# this matters because Claude Code's banner always specifies its TZ
+# (e.g. Europe/London) and users may be running claude-autocontinue in a
+# different system TZ (servers, containers, laptops on trips).
 epoch_of_reset() {
-    local reset="$1"
+    local reset="$1" tz="${2:-}" clean
     [ -z "$reset" ] && { echo 0; return; }
-    $DATE_BIN -d "$reset" +%s 2>/dev/null || echo 0
+    # Drop the comma between day-of-month and hour.
+    clean="$(printf '%s' "$reset" | sed -E 's/,//g')"
+    if [ -n "$tz" ]; then
+        TZ="$tz" $DATE_BIN -d "$clean" +%s 2>/dev/null || echo 0
+    else
+        $DATE_BIN -d "$clean" +%s 2>/dev/null || echo 0
+    fi
 }
 
 # ── Tmux wrappers ─────────────────────────────────────────────────────────────
@@ -149,7 +196,7 @@ send_continue() {
 # ── Main polling loop ─────────────────────────────────────────────────────────
 
 poll_once() {
-    local panes pane_id window_name content tail_content reset now reset_epoch last wait remaining last_server
+    local panes pane_id window_name content tail_content reset reset_tz now reset_epoch last wait remaining last_server
 
     # Use `|` as field separator so window names with spaces don't split.
     panes="$(tmux list-panes -a -F '#{pane_id}|#{window_name}' 2>/dev/null || true)"
@@ -193,17 +240,24 @@ poll_once() {
 
         reset="$(parse_reset_time "$tail_content")"
         if [ -z "$reset" ]; then
-            log "$window_name ($pane_id): banner detected (no reset time parsed)"
-            send_continue "$pane_id" "$window_name"
-            sleep 2
+            # v1.2.0 safety fix: previous behaviour was send_continue here,
+            # which spam-looped when banner format changed (e.g. the Apr 2026
+            # `resets Apr 23, 9pm (Europe/London)` form the v1.1 regex missed).
+            # Sending `continue` while the limit is active does nothing useful
+            # — it just re-prints the same banner. Back off instead and let
+            # the outer POLL_INTERVAL retry; by then the banner may have
+            # cleared OR a format we recognise may be in view.
+            log "$window_name ($pane_id): banner detected, no reset time parsed — backing off (not sending)"
+            LAST_SEND["$pane_id"]="$now"
             continue
         fi
 
-        reset_epoch="$(epoch_of_reset "$reset")"
+        reset_tz="$(parse_reset_timezone "$tail_content")"
+        reset_epoch="$(epoch_of_reset "$reset" "$reset_tz")"
         if [ "$reset_epoch" = 0 ]; then
-            log "$window_name ($pane_id): banner detected, reset '$reset' unparseable"
-            send_continue "$pane_id" "$window_name"
-            sleep 2
+            # Same safety fix as above: unparseable reset ≠ send continue.
+            log "$window_name ($pane_id): banner detected, reset '$reset' unparseable — backing off (not sending)"
+            LAST_SEND["$pane_id"]="$now"
             continue
         fi
 
@@ -216,11 +270,19 @@ poll_once() {
 
         remaining=$(( (reset_epoch - now) / 60 ))
         wait=$(( reset_epoch - now + 30 ))
-        log "$window_name ($pane_id): rate-limited, resets in ${remaining}m ($reset)"
+        log "$window_name ($pane_id): rate-limited, resets in ${remaining}m ($reset${reset_tz:+ $reset_tz})"
         if [ "$wait" -gt 0 ] && [ "$wait" -lt "$MAX_WAIT_SECONDS" ]; then
             log "  sleeping ${wait}s until reset"
             sleep "$wait"
             return  # break out of this poll pass so the next one re-scans everything fresh
+        fi
+        if [ "$wait" -ge "$MAX_WAIT_SECONDS" ]; then
+            # Reset is further away than our sleep cap. Do NOT send continue —
+            # the banner is active and any send just echoes it back. Mark the
+            # per-pane cooldown and let POLL_INTERVAL re-check later.
+            log "  reset is ${wait}s away (> MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS}s); skipping without sending"
+            LAST_SEND["$pane_id"]="$now"
+            continue
         fi
     done <<< "$panes"
 }
@@ -248,7 +310,7 @@ Options:
   --server-cooldown N  Min seconds between retries on transient server rate limits (default: 120)
   --scrollback N       Tmux capture scrollback depth     (default: 200)
   --tail N             Lines at end of capture to scan   (default: 30)
-  --max-wait N         Cap for "sleep until reset" (sec) (default: 7200)
+  --max-wait N         Cap for "sleep until reset" (sec) (default: 172800 = 48h)
   --log-file PATH      Tee log output to this file
   --dry-run            Detect and log only — never send keys
   --verbose            Log per-pane decisions, not just actions
@@ -263,6 +325,19 @@ content signature (not window name), so `/rename` inside Claude Code does not
 break detection.
 EOF
 }
+
+# Library mode: when sourced (e.g. from tests) with CAC_LIB_ONLY=1, expose
+# the pure functions without starting the daemon, running preflight, or
+# consuming the positional args (which bats may set to the current test
+# name; that would otherwise blow up our CLI parser).
+# `return` only works when sourced; if someone happened to execute the script
+# with this variable set, fall back to `exit 0`. shellcheck SC2317 sees the
+# `exit` as unreachable because it only analyses one entry mode.
+if [ "${CAC_LIB_ONLY:-0}" = 1 ]; then
+    return 0 2>/dev/null
+    # shellcheck disable=SC2317
+    exit 0
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -280,17 +355,6 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
-
-# Library mode: when sourced (e.g. from tests) with CAC_LIB_ONLY=1, expose
-# the pure functions without starting the daemon or running preflight.
-# `return` only works when sourced; if someone happened to execute the script
-# with this variable set, fall back to `exit 0`. shellcheck SC2317 sees the
-# `exit` as unreachable because it only analyses one entry mode.
-if [ "${CAC_LIB_ONLY:-0}" = 1 ]; then
-    return 0 2>/dev/null
-    # shellcheck disable=SC2317
-    exit 0
-fi
 
 # Preflight: confirm tmux is available and a server is running.
 command -v tmux >/dev/null 2>&1 || { echo "error: tmux not found in PATH" >&2; exit 1; }
