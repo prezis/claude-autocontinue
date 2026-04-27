@@ -287,6 +287,26 @@ poll_once() {
     done <<< "$panes"
 }
 
+# ── Startup banner ────────────────────────────────────────────────────────────
+
+_format_startup_config() {
+    # Single-line config summary printed at startup. The DRY-RUN suffix appears
+    # ONLY when DRY_RUN=1; never on the default DRY_RUN=0.
+    #
+    # Bug history (2026-04-27): the original implementation used
+    # `${DRY_RUN:+ DRY-RUN}`, which expands whenever DRY_RUN is set AND
+    # non-empty. The default DRY_RUN=0 is a non-empty string, so the suffix
+    # always appeared, falsely advertising dry-run mode in normal operation.
+    # Extracted to a function so it's testable; covered by tests/test_detection.bats.
+    local dry_suffix=""
+    if [ "${DRY_RUN:-0}" = 1 ]; then
+        dry_suffix=" DRY-RUN"
+    fi
+    printf 'poll=%ss cooldown=%ss server-cooldown=%ss scrollback=%s tail=%s%s' \
+        "$POLL_INTERVAL" "$SEND_COOLDOWN" "$SERVER_LIMIT_COOLDOWN" \
+        "$SCROLLBACK_DEPTH" "$TAIL_LINES" "$dry_suffix"
+}
+
 # ── Signal handling ───────────────────────────────────────────────────────────
 
 on_exit() {
@@ -361,7 +381,7 @@ command -v tmux >/dev/null 2>&1 || { echo "error: tmux not found in PATH" >&2; e
 tmux list-sessions >/dev/null 2>&1 || { echo "error: no running tmux server" >&2; exit 1; }
 
 log "claude-autocontinue $VERSION starting"
-log "poll=${POLL_INTERVAL}s cooldown=${SEND_COOLDOWN}s server-cooldown=${SERVER_LIMIT_COOLDOWN}s scrollback=${SCROLLBACK_DEPTH} tail=${TAIL_LINES}${DRY_RUN:+ DRY-RUN}"
+log "$(_format_startup_config)"
 
 while true; do
     poll_once

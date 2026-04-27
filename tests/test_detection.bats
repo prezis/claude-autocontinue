@@ -236,3 +236,40 @@ setup() {
     epoch="$(epoch_of_reset "$reset")"
     [ "$epoch" -gt 0 ]
 }
+
+# ── _format_startup_config: regression for the DRY-RUN banner bug ─────────────
+# Bug 2026-04-27: original used `${DRY_RUN:+ DRY-RUN}`, which expands whenever
+# DRY_RUN is non-empty. The default `DRY_RUN=0` is non-empty (the string "0"),
+# so the banner falsely advertised dry-run mode in normal operation.
+
+@test "_format_startup_config: omits DRY-RUN suffix when DRY_RUN=0 (the default)" {
+    DRY_RUN=0
+    run _format_startup_config
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"DRY-RUN"* ]]
+}
+
+@test "_format_startup_config: omits DRY-RUN suffix when DRY_RUN is unset" {
+    unset DRY_RUN
+    run _format_startup_config
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"DRY-RUN"* ]]
+}
+
+@test "_format_startup_config: includes DRY-RUN suffix only when DRY_RUN=1" {
+    DRY_RUN=1
+    run _format_startup_config
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DRY-RUN"* ]]
+}
+
+@test "_format_startup_config: contains every config field" {
+    DRY_RUN=0
+    run _format_startup_config
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"poll="* ]]
+    [[ "$output" == *"cooldown="* ]]
+    [[ "$output" == *"server-cooldown="* ]]
+    [[ "$output" == *"scrollback="* ]]
+    [[ "$output" == *"tail="* ]]
+}
